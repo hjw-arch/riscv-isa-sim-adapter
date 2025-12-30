@@ -11,25 +11,11 @@ using namespace spike_engine;
 PYBIND11_MODULE(spike_engine, m) {
     m.doc() = "Efficient Spike execution engine with checkpointing for DiveFuzz";
 
-    // Constants
-    m.attr("IMMEDIATE_NOT_PRESENT") = IMMEDIATE_NOT_PRESENT;
-
     // Floating-point register index offset
     // Register index convention:
     // - 0-31: Integer registers (x0-x31)
     // - 32-63: Floating-point registers (f0-f31, use FPR_OFFSET + reg_num)
     m.attr("FPR_OFFSET") = 32;
-
-    // ExecutionResult class
-    py::class_<ExecutionResult>(m, "ExecutionResult")
-        .def(py::init<>())
-        .def(py::init<const std::vector<uint64_t>&, const std::vector<uint64_t>&>(),
-             py::arg("source_values_before"),
-             py::arg("dest_values_after"))
-        .def_readwrite("source_values_before", &ExecutionResult::source_values_before,
-             "Source register values captured BEFORE execution (for XOR computation)")
-        .def_readwrite("dest_values_after", &ExecutionResult::dest_values_after,
-             "Destination register values captured AFTER execution (for bug filtering)");
 
     // Checkpoint class
     py::class_<Checkpoint>(m, "Checkpoint")
@@ -80,72 +66,35 @@ PYBIND11_MODULE(spike_engine, m) {
         .def("restore_checkpoint", &SpikeEngine::restore_checkpoint,
              "Restore processor state from last checkpoint")
 
-        .def("execute_instruction", &SpikeEngine::execute_instruction,
-             py::arg("machine_code"),
-             py::arg("source_regs"),
-             py::arg("dest_regs"),
-             py::arg("immediate") = 0,
-             R"pbdoc(
-             Execute one instruction and return register values
-
-             Args:
-                 machine_code: 32-bit machine code
-                 source_regs: List of source register indices (read before execution)
-                 dest_regs: List of destination register indices (read after execution)
-                 immediate: Immediate value (default: 0)
-
-             Returns:
-                 ExecutionResult with:
-                 - source_values_before: Source register values before execution (for XOR)
-                 - dest_values_after: Destination register values after execution (for bug filtering)
-             )pbdoc")
-
-        .def("execute_instruction_sequence", &SpikeEngine::execute_instruction_sequence,
+        .def("execute_sequence", &SpikeEngine::execute_sequence,
              py::arg("machine_codes"),
              py::arg("sizes"),
+             py::arg("max_steps") = 10000,
              R"pbdoc(
-             Execute a sequence of instructions (for jump sequences)
+             Execute a sequence of instructions
 
-             Writes all instructions to memory first, then executes them sequentially.
-             Used for forward jumps where we need to execute jump + middle instructions.
+             Unified execution method that handles all cases:
+             - Single instruction: execute_sequence([code], [size])
+             - Forward jump: execute_sequence([jump, middle...], [sizes...])
+             - Backward loop: execute_sequence([init, body..., decr, branch], [sizes...])
+
+             Execution logic:
+             1. Write all instructions to memory
+             2. Calculate end_addr = current_addr + sum(sizes)
+             3. Execute until PC >= end_addr
+             4. Each step handles traps automatically
+
+             For loops (backward branches):
+             - When branch jumps back, PC < end_addr, so execution continues
+             - When branch falls through, PC >= end_addr, loop exits
 
              Args:
                  machine_codes: List of machine codes to execute
                  sizes: List of instruction sizes (2 or 4 bytes each)
+                 max_steps: Maximum execution steps (safety limit, default: 10000)
 
              Returns:
-                 Number of instructions successfully executed
-             )pbdoc")
-
-        .def("execute_loop_sequence", &SpikeEngine::execute_loop_sequence,
-             py::arg("init_code"),
-             py::arg("init_size"),
-             py::arg("loop_body_codes"),
-             py::arg("loop_body_sizes"),
-             py::arg("decr_code"),
-             py::arg("decr_size"),
-             py::arg("branch_code"),
-             py::arg("branch_size"),
-             py::arg("max_iterations") = 100,
-             R"pbdoc(
-             Execute a loop sequence until branch condition fails
-
-             Structure: init + (loop_body + decr + branch)*
-             Executes init once, then loops body+decr+branch until branch doesn't jump back.
-
-             Args:
-                 init_code: Initialization instruction machine code
-                 init_size: Size of init instruction (2 or 4)
-                 loop_body_codes: List of loop body instruction codes
-                 loop_body_sizes: List of loop body instruction sizes
-                 decr_code: Decrement instruction code
-                 decr_size: Size of decrement instruction
-                 branch_code: Branch instruction code
-                 branch_size: Size of branch instruction
-                 max_iterations: Maximum iterations (default: 100)
-
-             Returns:
-                 Actual number of iterations executed
+                 Number of steps executed
              )pbdoc")
 
         .def("get_xpr", &SpikeEngine::get_xpr,
@@ -190,8 +139,30 @@ PYBIND11_MODULE(spike_engine, m) {
              "Get total number of instructions")
 
         .def("get_last_error", &SpikeEngine::get_last_error,
-             "Get last error message");
+             "Get last error message")
+
+        .def("was_last_execution_trapped", &SpikeEngine::was_last_execution_trapped,
+             R"pbdoc(
+             Check if the last executed instruction triggered a trap/exception.
+
+             This is useful for logging - instructions that cause traps are handled
+             by the exception handler (which skips them), but they are still "accepted"
+             from the fuzzer's perspective.
+
+             Returns:
+                 True if the last instruction triggered a trap, False otherwise
+             )pbdoc")
+
+        .def("get_last_trap_handler_steps", &SpikeEngine::get_last_trap_handler_steps,
+             R"pbdoc(
+             Get the number of trap handler steps executed in the last execution.
+
+             Returns 0 if no trap occurred.
+
+             Returns:
+                 Number of steps executed in trap handler
+             )pbdoc");
 
     // Version info
-    m.attr("__version__") = "2.0.0";
+    m.attr("__version__") = "3.0.0";
 }

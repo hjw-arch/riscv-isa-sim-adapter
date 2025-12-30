@@ -17,35 +17,6 @@ class cfg_t;
 
 namespace spike_engine {
 
-// Special value to indicate instruction without immediate operand
-constexpr int64_t IMMEDIATE_NOT_PRESENT = INT64_MIN;
-
-/**
- * Execution result containing register values before and after instruction execution
- *
- * This structure is returned by execute_instruction() and contains:
- * - source_values_before: Source register values BEFORE execution (for XOR computation)
- * - dest_values_after: Destination register values AFTER execution (for bug filtering)
- *
- * Design Rationale:
- * - Python layer computes XOR from source_values_before for deduplication
- * - Python layer uses dest_values_after for bug pattern matching
- * - Separating these concerns keeps spike_engine simple and focused on execution
- */
-struct ExecutionResult {
-    // Source register values captured BEFORE instruction execution
-    // Used for XOR-based deduplication in Python layer
-    std::vector<uint64_t> source_values_before;
-
-    // Destination register values captured AFTER instruction execution
-    // Used for bug filtering in Python layer (e.g., checking if sc.w returned 1)
-    std::vector<uint64_t> dest_values_after;
-
-    ExecutionResult() = default;
-    ExecutionResult(const std::vector<uint64_t>& src, const std::vector<uint64_t>& dst)
-        : source_values_before(src), dest_values_after(dst) {}
-};
-
 /**
  * Checkpoint state for processor
  *
@@ -62,7 +33,7 @@ struct ExecutionResult {
  *   After restore, memory may contain instructions that were executed after
  *   the checkpoint, but this is safe because:
  *   1. PC and next_instruction_addr point to the checkpoint position
- *   2. Subsequent execute_instruction() calls will overwrite old instructions
+ *   2. Subsequent execute_sequence() calls will overwrite old instructions
  *   3. Instructions past the checkpoint position will never be executed
  */
 struct Checkpoint {
@@ -70,7 +41,10 @@ struct Checkpoint {
     std::vector<uint64_t> xpr;
 
     // Floating point registers (f0-f31)
-    std::vector<uint64_t> fpr;
+    // freg_t has two 64-bit fields: v[0] and v[1]
+    // Both must be saved/restored for correct NaN-boxing behavior
+    std::vector<uint64_t> fpr;      // FPR[i].v[0] - main 64-bit value
+    std::vector<uint64_t> fpr_v1;   // FPR[i].v[1] - extended/internal state
 
     // Program counter
     uint64_t pc;
@@ -120,20 +94,23 @@ struct Checkpoint {
  * (16-bit compressed and 32-bit standard) and efficient checkpoint/restore.
  *
  * Key Features:
+ *   - Unified execution model: One method handles all cases (single, jump, loop)
  *   - Mixed-length instruction support (RV*C compressed + standard)
  *   - Dynamic address allocation (no pre-allocated slots)
  *   - Lightweight checkpointing (registers + index only)
- *   - XOR-based instruction validation for fuzzing
+ *   - Python layer handles XOR validation (simpler, more flexible)
  *
  * Typical Workflow:
  *   1. Initialize with pre-compiled ELF template (containing nop placeholder region)
  *   2. Engine executes template initialization code until reaching main()
  *   3. For each instruction to test:
  *      a. set_checkpoint() - save current processor state
- *      b. execute_instruction() - write instruction to memory and execute
- *      c. Check if XOR value is unique (collision detection)
- *      d. If collision: restore_checkpoint() and retry with different instruction
- *         If unique: proceed to next instruction (checkpoint will be updated)
+ *      b. Read source register values (Python: get_xpr/get_fpr)
+ *      c. execute_sequence() - write and execute instruction(s)
+ *      d. Read destination register values (Python: get_xpr/get_fpr)
+ *      e. Python computes XOR and checks uniqueness
+ *      f. If collision: restore_checkpoint() and retry
+ *         If unique: proceed to next instruction
  *
  * Memory Management:
  *   Instructions are written sequentially starting from main symbol address.
@@ -148,10 +125,10 @@ struct Checkpoint {
  *   engine.initialize();
  *
  *   engine.set_checkpoint();
- *   uint64_t xor_val = engine.execute_instruction(0x003100b3, {2, 3}, 0);
- *   if (is_duplicate(xor_val)) {
- *       engine.restore_checkpoint();  // Try different instruction
- *   }
+ *   uint64_t src_val = engine.get_xpr(2);  // Read x2 before
+ *   engine.execute_sequence({0x003100b3}, {4});  // add x1, x2, x3
+ *   uint64_t dst_val = engine.get_xpr(1);  // Read x1 after
+ *   // Python: compute XOR, check uniqueness, etc.
  */
 class SpikeEngine {
 public:
@@ -191,95 +168,40 @@ public:
     void restore_checkpoint();
 
     /**
-     * Execute a sequence of instructions (for jump sequences)
+     * Execute a sequence of instructions
      *
-     * Writes all instructions to memory first, then executes them sequentially.
-     * Used for forward jumps where we need to execute jump + middle instructions.
+     * Unified execution method that handles all cases:
+     * - Single instruction: execute_sequence([code], [size])
+     * - Forward jump: execute_sequence([jump, middle...], [sizes...])
+     * - Backward loop: execute_sequence([init, body..., decr, branch], [sizes...])
+     *
+     * Execution logic:
+     * 1. Write all instructions to memory starting at next_instruction_addr_
+     * 2. Calculate end_addr = next_instruction_addr_ + sum(sizes)
+     * 3. Execute until PC >= end_addr (handles jumps and loops automatically)
+     * 4. Each step uses step_until_in_region() to handle traps
+     * 5. Update next_instruction_addr_ to current PC
+     *
+     * For loops (backward branches):
+     * - When branch jumps back, PC < end_addr, so execution continues
+     * - When branch falls through, PC >= end_addr, loop exits
      *
      * @param machine_codes List of machine codes to execute
      * @param sizes List of instruction sizes (2 or 4 bytes each)
-     * @return Number of instructions successfully executed
-     *
-     * @throws std::runtime_error if execution fails
-     */
-    size_t execute_instruction_sequence(
-        const std::vector<uint32_t>& machine_codes,
-        const std::vector<size_t>& sizes);
-
-    /**
-     * Execute a loop sequence until branch condition fails
-     *
-     * Structure: init + (loop_body + decr + branch)*
-     * Executes init once, then loops body+decr+branch until branch doesn't jump back.
-     *
-     * @param init_code Initialization instruction (e.g., li s11, 5)
-     * @param init_size Size of init instruction
-     * @param loop_body_codes Instructions in loop body
-     * @param loop_body_sizes Sizes of loop body instructions
-     * @param decr_code Decrement instruction (e.g., addi s11, s11, -1)
-     * @param decr_size Size of decrement instruction
-     * @param branch_code Branch instruction (e.g., bne s11, zero, offset)
-     * @param branch_size Size of branch instruction
-     * @param max_iterations Maximum iterations (safety limit)
-     * @return Actual number of iterations executed
-     *
-     * @throws std::runtime_error if execution fails
-     */
-    size_t execute_loop_sequence(
-        uint32_t init_code,
-        size_t init_size,
-        const std::vector<uint32_t>& loop_body_codes,
-        const std::vector<size_t>& loop_body_sizes,
-        uint32_t decr_code,
-        size_t decr_size,
-        uint32_t branch_code,
-        size_t branch_size,
-        size_t max_iterations = 100);
-
-    /**
-     * Execute one instruction and return register values for XOR and bug filtering
-     *
-     * Automatically detects instruction size (2 or 4 bytes), writes it to the
-     * next available memory address, executes it, and captures register values
-     * before and after execution.
-     *
-     * Process:
-     *   1. Detect instruction size from machine_code bits[1:0]
-     *   2. Verify sufficient space in instruction region
-     *   3. Verify PC matches expected address (consistency check)
-     *   4. Write instruction to memory (2 or 4 bytes as appropriate)
-     *   5. Read source register values (BEFORE execution) -> source_values_before
-     *   6. Execute instruction (single step)
-     *   7. Read destination register values (AFTER execution) -> dest_values_after
-     *   8. Update next_instruction_addr to current PC
-     *   9. Increment instruction index counter
-     *  10. Return ExecutionResult with both sets of values
-     *
-     * @param machine_code 32-bit instruction encoding (may be 16-bit compressed
-     *                     instruction zero-padded to 32 bits)
-     * @param source_regs List of source register indices (0-31) to read before execution
-     * @param dest_regs List of destination register indices (0-31) to read after execution
-     * @param immediate Optional immediate value to include in source_values (default: 0)
-     *
-     * @return ExecutionResult containing:
-     *   - source_values_before: Source register values + immediate (for XOR in Python)
-     *   - dest_values_after: Destination register values (for bug filtering in Python)
+     * @param max_steps Maximum execution steps (safety limit, default: 10000)
+     * @return Number of steps executed
      *
      * @throws std::runtime_error if:
      *   - Engine not initialized
      *   - Out of instruction region space
      *   - PC mismatch (internal consistency error)
      *   - Memory write failure
-     *   - Instruction execution failure
-     *
-     * @note For compressed instructions (bits[1:0] != 0b11), only the low 16 bits
-     *       are written to memory. Spike automatically updates PC by 2 or 4 bytes
-     *       based on the instruction encoding.
+     *   - Execution failure or max_steps exceeded
      */
-    ExecutionResult execute_instruction(uint32_t machine_code,
-                                       const std::vector<int>& source_regs,
-                                       const std::vector<int>& dest_regs,
-                                       int64_t immediate = 0);
+    size_t execute_sequence(
+        const std::vector<uint32_t>& machine_codes,
+        const std::vector<size_t>& sizes,
+        size_t max_steps = 10000);
 
     /**
      * Get value of a general-purpose register
@@ -363,6 +285,24 @@ public:
     std::string get_last_error() const { return last_error_; }
 
     /**
+     * Check if the last executed instruction triggered a trap/exception.
+     * This is useful for logging - instructions that cause traps are handled
+     * by the exception handler (which skips them), but they are still "accepted"
+     * from the fuzzer's perspective.
+     *
+     * @return true if the last instruction triggered a trap, false otherwise
+     */
+    bool was_last_execution_trapped() const { return last_execution_trapped_; }
+
+    /**
+     * Get the number of trap handler steps executed in the last execution.
+     * Returns 0 if no trap occurred.
+     *
+     * @return Number of steps executed in trap handler
+     */
+    size_t get_last_trap_handler_steps() const { return last_trap_handler_steps_; }
+
+    /**
      * Detect instruction size from machine code (static utility)
      *
      * Determines whether an instruction is 16-bit compressed or 32-bit standard
@@ -417,6 +357,10 @@ private:
     // Error handling
     std::string last_error_;
 
+    // Trap detection (for logging)
+    bool last_execution_trapped_;      // True if last instruction triggered a trap
+    size_t last_trap_handler_steps_;   // Steps executed in trap handler (0 if no trap)
+
     // Internal helper methods
 
     /**
@@ -451,7 +395,7 @@ private:
     /**
      * Check if PC is within the instruction region
      * @param pc Program counter value to check
-     * @return true if PC is within [instruction_region_start_, instruction_region_end_)
+     * @return true if PC is within [instruction_region_start_, instruction_region_end_]
      */
     bool is_in_instruction_region(uint64_t pc) const;
 
@@ -475,12 +419,6 @@ private:
      *   - Exception occurred during trap handler execution
      */
     bool step_until_in_region();
-
-    /**
-     * Compute XOR value from register values
-     * XOR = (v[0] << 0) ^ (v[1] << 1) ^ (v[2] << 2) ^ ...
-     */
-    uint64_t compute_xor(const std::vector<uint64_t>& values) const;
 
     /**
      * Save processor state to checkpoint

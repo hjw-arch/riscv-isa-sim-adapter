@@ -4,6 +4,7 @@
 #include "../riscv/mmu.h"
 #include "../riscv/cfg.h"
 #include "../riscv/decode.h"
+#include "../riscv/decode_macros.h"  // For wait_for_interrupt_t
 #include "../riscv/trap.h"
 #include "../riscv/encoding.h"
 
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <numeric>
 
 namespace spike_engine {
 
@@ -23,6 +25,7 @@ namespace spike_engine {
 Checkpoint::Checkpoint()
     : xpr(32, 0)
     , fpr(32, 0)
+    , fpr_v1(32, 0)  // FPR v[1] field for complete freg_t restoration
     , pc(0)
     , instr_index(0)
     , next_instruction_addr(0)
@@ -53,6 +56,8 @@ SpikeEngine::SpikeEngine(const std::string& elf_path,
     , current_instr_index_(0)
     , checkpoint_valid_(false)
     , initialized_(false)
+    , last_execution_trapped_(false)
+    , last_trap_handler_steps_(0)
 {
 }
 
@@ -100,16 +105,8 @@ bool SpikeEngine::initialize() {
         cfg_->mem_layout.push_back(mem_cfg_t(0x80000000, 0x10000000));
 
         // Setup memory regions
-        // We need two memory regions:
-        // 1. Low memory for HTIF boot code (avoid [0, 0x1000) which Spike reserves)
-        // 2. Main memory for our ELF (0x80000000 - 0x90000000)
+        // create main memory for our ELF (0x80000000 - 0x90000000)
         std::vector<std::pair<reg_t, abstract_mem_t*>> mems;
-
-        // Low memory for boot code (starting after Spike's reserved region)
-        mems.push_back(std::make_pair(0x1000, new mem_t(0xF000)));  // 60KB from 0x1000
-        if (verbose_) {
-            std::cout << "[SpikeEngine] Created boot memory: 0x1000 - 0x10000" << std::endl;
-        }
 
         // Main memory for ELF
         reg_t mem_base = 0x80000000;
@@ -133,7 +130,7 @@ bool SpikeEngine::initialize() {
             htif_args,
             dm_config,
             /*log_path=*/nullptr,
-            /*dtb_enabled=*/false,  // Disable DTB for simple testing
+            /*dtb_enabled=*/true,   // Enable boot ROM for consistent minstret with spike
             /*dtb_file=*/nullptr,
             /*socket_enabled=*/false,
             /*cmd_file=*/nullptr,
@@ -371,9 +368,10 @@ void SpikeEngine::restore_checkpoint() {
     restore_state(checkpoint_);
 }
 
-size_t SpikeEngine::execute_instruction_sequence(
+size_t SpikeEngine::execute_sequence(
     const std::vector<uint32_t>& machine_codes,
-    const std::vector<size_t>& sizes) {
+    const std::vector<size_t>& sizes,
+    size_t max_steps) {
 
     if (!initialized_) {
         throw std::runtime_error("SpikeEngine not initialized");
@@ -388,182 +386,10 @@ size_t SpikeEngine::execute_instruction_sequence(
     }
 
     // Calculate total size needed
-    size_t total_size = 0;
-    for (size_t s : sizes) {
-        total_size += s;
-    }
+    size_t total_size = std::accumulate(sizes.begin(), sizes.end(), size_t(0));
 
     // Check if we have enough space
     if (next_instruction_addr_ + total_size > instruction_region_end_) {
-        throw std::runtime_error("Out of instruction region space for sequence");
-    }
-
-    // Verify PC matches next instruction address
-    uint64_t current_pc = get_pc();
-    if (current_pc != next_instruction_addr_) {
-        std::ostringstream oss;
-        oss << "PC mismatch in sequence: expected 0x" << std::hex << next_instruction_addr_
-            << " but got 0x" << current_pc << std::dec;
-        throw std::runtime_error(oss.str());
-    }
-
-    // Step 1: Write all instructions to memory
-    uint64_t write_addr = next_instruction_addr_;
-    for (size_t i = 0; i < machine_codes.size(); ++i) {
-        if (!write_memory(write_addr, machine_codes[i], sizes[i])) {
-            throw std::runtime_error("Failed to write instruction to memory in sequence");
-        }
-        write_addr += sizes[i];
-    }
-
-    // Step 2: Execute all instructions with trap handling
-    size_t executed = 0;
-    for (size_t i = 0; i < machine_codes.size(); ++i) {
-        if (!step_until_in_region()) {
-            std::ostringstream oss;
-            oss << "Failed to execute instruction " << i << " in sequence: " << last_error_;
-            throw std::runtime_error(oss.str());
-        }
-        executed++;
-        current_instr_index_++;
-    }
-
-    // Update next instruction address
-    next_instruction_addr_ = get_pc();
-
-    return executed;
-}
-
-size_t SpikeEngine::execute_loop_sequence(
-    uint32_t init_code,
-    size_t init_size,
-    const std::vector<uint32_t>& loop_body_codes,
-    const std::vector<size_t>& loop_body_sizes,
-    uint32_t decr_code,
-    size_t decr_size,
-    uint32_t branch_code,
-    size_t branch_size,
-    size_t max_iterations) {
-
-    if (!initialized_) {
-        throw std::runtime_error("SpikeEngine not initialized");
-    }
-
-    if (loop_body_codes.size() != loop_body_sizes.size()) {
-        throw std::runtime_error("loop_body_codes and loop_body_sizes must have the same length");
-    }
-
-    // Calculate total size for one iteration
-    size_t body_size = 0;
-    for (size_t s : loop_body_sizes) {
-        body_size += s;
-    }
-    size_t loop_iteration_size = body_size + decr_size + branch_size;
-    size_t total_size = init_size + loop_iteration_size;
-
-    // Check space (we only need space for one iteration since we reuse it)
-    if (next_instruction_addr_ + total_size > instruction_region_end_) {
-        throw std::runtime_error("Out of instruction region space for loop");
-    }
-
-    // Verify PC
-    uint64_t current_pc = get_pc();
-    if (current_pc != next_instruction_addr_) {
-        std::ostringstream oss;
-        oss << "PC mismatch in loop: expected 0x" << std::hex << next_instruction_addr_
-            << " but got 0x" << current_pc << std::dec;
-        throw std::runtime_error(oss.str());
-    }
-
-    // Step 1: Write init instruction
-    uint64_t init_addr = next_instruction_addr_;
-    if (!write_memory(init_addr, init_code, init_size)) {
-        throw std::runtime_error("Failed to write init instruction");
-    }
-
-    // Step 2: Write loop body
-    uint64_t loop_start_addr = init_addr + init_size;
-    uint64_t write_addr = loop_start_addr;
-    for (size_t i = 0; i < loop_body_codes.size(); ++i) {
-        if (!write_memory(write_addr, loop_body_codes[i], loop_body_sizes[i])) {
-            throw std::runtime_error("Failed to write loop body instruction");
-        }
-        write_addr += loop_body_sizes[i];
-    }
-
-    // Step 3: Write decrement instruction
-    uint64_t decr_addr = write_addr;
-    if (!write_memory(decr_addr, decr_code, decr_size)) {
-        throw std::runtime_error("Failed to write decrement instruction");
-    }
-    write_addr += decr_size;
-
-    // Step 4: Write branch instruction
-    uint64_t branch_addr = write_addr;
-    if (!write_memory(branch_addr, branch_code, branch_size)) {
-        throw std::runtime_error("Failed to write branch instruction");
-    }
-    uint64_t loop_end_addr = write_addr + branch_size;
-
-    // Step 5: Execute init with trap handling
-    if (!step_until_in_region()) {
-        throw std::runtime_error("Failed to execute init instruction: " + last_error_);
-    }
-    current_instr_index_++;
-
-    // Step 6: Execute loop iterations with trap handling
-    size_t iterations = 0;
-    while (iterations < max_iterations) {
-        // Execute loop body
-        for (size_t i = 0; i < loop_body_codes.size(); ++i) {
-            if (!step_until_in_region()) {
-                throw std::runtime_error("Failed to execute loop body: " + last_error_);
-            }
-            current_instr_index_++;
-        }
-
-        // Execute decrement
-        if (!step_until_in_region()) {
-            throw std::runtime_error("Failed to execute decrement: " + last_error_);
-        }
-        current_instr_index_++;
-
-        // Execute branch
-        if (!step_until_in_region()) {
-            throw std::runtime_error("Failed to execute branch: " + last_error_);
-        }
-        current_instr_index_++;
-
-        iterations++;
-
-        // Check if branch jumped back or fell through
-        current_pc = get_pc();
-        if (current_pc >= loop_end_addr) {
-            // Branch fell through (condition false), exit loop
-            break;
-        }
-        // Otherwise, branch jumped back, continue loop
-    }
-
-    // Update next instruction address
-    next_instruction_addr_ = get_pc();
-
-    return iterations;
-}
-
-ExecutionResult SpikeEngine::execute_instruction(uint32_t machine_code,
-                                                  const std::vector<int>& source_regs,
-                                                  const std::vector<int>& dest_regs,
-                                                  int64_t immediate) {
-    if (!initialized_) {
-        throw std::runtime_error("SpikeEngine not initialized");
-    }
-
-    // Detect instruction size (2 for compressed, 4 for standard)
-    size_t instr_size = get_instruction_size(machine_code);
-
-    // Check if we have enough space
-    if (next_instruction_addr_ + instr_size > instruction_region_end_) {
         throw std::runtime_error("Out of instruction region space");
     }
 
@@ -576,77 +402,47 @@ ExecutionResult SpikeEngine::execute_instruction(uint32_t machine_code,
         throw std::runtime_error(oss.str());
     }
 
-    // Get instruction address
-    uint64_t instr_addr = next_instruction_addr_;
-
-    // Write machine code with correct size
-    if (!write_memory(instr_addr, machine_code, instr_size)) {
-        throw std::runtime_error("Failed to write machine code to memory");
-    }
-
-    // STEP 1: Read source register values BEFORE execution
-    // This ensures we capture the values that will be used by the instruction,
-    // even if the destination register overlaps with source registers
-    // (e.g., add x10, x10, x11 - we want the OLD value of x10, not the result)
-    //
-    // Register index convention:
-    // - 0-31: Integer registers (x0-x31)
-    // - 32-63: Floating-point registers (f0-f31, mapped as 32+reg_num)
-    std::vector<uint64_t> source_values;
-    for (int reg_idx : source_regs) {
-        if (reg_idx >= 0 && reg_idx < 32) {
-            // Integer register (x0-x31)
-            source_values.push_back(get_xpr(reg_idx));
-        } else if (reg_idx >= 32 && reg_idx < 64) {
-            // Floating-point register (f0-f31, mapped as 32+reg_num)
-            source_values.push_back(get_fpr(reg_idx - 32));
+    // Step 1: Write all instructions to memory
+    uint64_t write_addr = next_instruction_addr_;
+    for (size_t i = 0; i < machine_codes.size(); ++i) {
+        if (!write_memory(write_addr, machine_codes[i], sizes[i])) {
+            throw std::runtime_error("Failed to write instruction to memory");
         }
+        write_addr += sizes[i];
     }
 
-    // Add immediate if instruction has one (including immediate=0)
-    if (immediate != IMMEDIATE_NOT_PRESENT) {
-        source_values.push_back(static_cast<uint64_t>(immediate));
+    // end_pc is the address right after the last instruction
+    uint64_t end_pc = write_addr;
+
+    // Step 2: Execute instructions until PC reaches or exceeds end_pc
+    // This correctly handles:
+    // - Single instruction: PC advances to end_pc after one step
+    // - Forward jumps: PC may jump past intermediate instructions
+    // - Backward loops: PC jumps back, continues until branch falls through
+    size_t executed = 0;
+
+    while (get_pc() < end_pc && executed < max_steps) {
+        if (!step_until_in_region()) {
+            std::ostringstream oss;
+            oss << "Failed to execute instruction (step=" << executed
+                << ", PC=0x" << std::hex << get_pc() << "): " << last_error_;
+            throw std::runtime_error(oss.str());
+        }
+        executed++;
+        current_instr_index_++;
     }
 
-    // STEP 2: Execute instruction with trap handling
-    // Use step_until_in_region() instead of step_processor() to handle traps.
-    // If the instruction triggers a trap, Spike's internal take_trap() will
-    // jump to the trap handler. We need to continue executing until the
-    // trap handler completes (via mret/sret) and PC returns to instruction region.
-    if (!step_until_in_region()) {
+    if (executed >= max_steps) {
         std::ostringstream oss;
-        oss << "Failed to execute instruction at 0x" << std::hex << instr_addr
-            << std::dec << " - " << last_error_;
+        oss << "Execution exceeded max_steps (" << max_steps << "), PC=0x"
+            << std::hex << get_pc() << ", end_pc=0x" << end_pc;
         throw std::runtime_error(oss.str());
     }
 
-
-    // STEP 3: Read destination register values AFTER execution (and after trap handling)
-    // These values are used for bug filtering in Python (e.g., checking if sc.w returned 1)
-    //
-    // Register index convention (same as source registers):
-    // - 0-31: Integer registers (x0-x31)
-    // - 32-63: Floating-point registers (f0-f31, mapped as 32+reg_num)
-    std::vector<uint64_t> dest_values;
-    for (int reg_idx : dest_regs) {
-        if (reg_idx >= 0 && reg_idx < 32) {
-            // Integer register (x0-x31)
-            dest_values.push_back(get_xpr(reg_idx));
-        } else if (reg_idx >= 32 && reg_idx < 64) {
-            // Floating-point register (f0-f31, mapped as 32+reg_num)
-            dest_values.push_back(get_fpr(reg_idx - 32));
-        }
-    }
-
     // Update next instruction address to current PC
-    // Now PC should be at the instruction after the one we executed (post trap handling)
     next_instruction_addr_ = get_pc();
 
-    // Increment instruction index
-    current_instr_index_++;
-
-    // Return both source values (for XOR) and dest values (for bug filtering)
-    return ExecutionResult(source_values, dest_values);
+    return executed;
 }
 
 uint64_t SpikeEngine::get_xpr(int reg_index) const {
@@ -765,6 +561,11 @@ bool SpikeEngine::write_memory(uint64_t addr, uint32_t code, size_t size) {
             return false;
         }
 
+        // CRITICAL: Flush TLB and instruction cache after writing to instruction memory.
+        // flush_tlb() clears all TLB entries (insn/load/store) and also calls flush_icache().
+        // This ensures consistent state for both instruction fetch and data access (e.g., AMO).
+        mmu->flush_tlb();
+
         return true;
     } catch (const std::exception& e) {
         last_error_ = std::string("Memory write failed: ") + e.what();
@@ -782,7 +583,10 @@ uint32_t SpikeEngine::read_memory(uint64_t addr) {
 }
 
 bool SpikeEngine::is_in_instruction_region(uint64_t pc) const {
-    return pc >= instruction_region_start_ && pc < instruction_region_end_;
+    // Use <= to include instruction_region_end_ as a valid "returned" position.
+    // This handles the case where the last instruction causes a trap and the
+    // trap handler returns to MEPC+4 = instruction_region_end_.
+    return pc >= instruction_region_start_ && pc <= instruction_region_end_;
 }
 
 bool SpikeEngine::step_processor() {
@@ -810,13 +614,36 @@ bool SpikeEngine::step_processor() {
         last_error_ = std::string("Processor step failed: ") + e.what();
         return false;
     } catch (...) {
-        // Catch all other exceptions
-        last_error_ = "Processor step failed: Caught an unknown exception!";
+        // Catch all other exceptions - try to get more info
+        std::exception_ptr eptr = std::current_exception();
+        std::ostringstream oss;
+        oss << "Processor step failed: Caught an unknown exception!";
+
+        // Try to rethrow and catch as different types for more info
+        if (eptr) {
+            try {
+                std::rethrow_exception(eptr);
+            } catch (const std::exception& e) {
+                oss << " (std::exception: " << e.what() << ")";
+            } catch (const char* msg) {
+                oss << " (C-string: " << msg << ")";
+            } catch (int e) {
+                oss << " (int: " << e << ")";
+            } catch (...) {
+                oss << " (truly unknown type)";
+            }
+        }
+
+        last_error_ = oss.str();
         return false;
     }
 }
 
 bool SpikeEngine::step_until_in_region() {
+    // Reset trap detection state
+    last_execution_trapped_ = false;
+    last_trap_handler_steps_ = 0;
+
     // Maximum steps to allow for trap handler execution
     // Trap handlers are typically short (< 20 instructions), but we allow
     // more steps for safety (e.g., nested handlers, complex dispatch)
@@ -826,6 +653,12 @@ bool SpikeEngine::step_until_in_region() {
     // Step 1: Execute the target instruction
     try {
         proc_->step(1);
+    } catch (wait_for_interrupt_t&) {
+        // WFI instruction - the processor is waiting for an interrupt.
+        // In fuzzing context, we treat this as a successful instruction execution.
+        // The PC has already been updated by set_pc_and_serialize() in the wfi() macro.
+        // We simply return success and continue execution.
+        return true;
     } catch (trap_t& t) {
         // Note: Spike normally handles traps internally via take_trap() in execute.cc
         // and does NOT throw here. This catch is a fallback for unusual situations.
@@ -844,7 +677,22 @@ bool SpikeEngine::step_until_in_region() {
         last_error_ = std::string("Initial step failed: ") + e.what();
         return false;
     } catch (...) {
-        last_error_ = "Initial step failed: Unknown exception";
+        // Try to get more exception info
+        std::exception_ptr eptr = std::current_exception();
+        std::ostringstream oss;
+        oss << "Initial step failed: Unknown exception";
+        if (eptr) {
+            try {
+                std::rethrow_exception(eptr);
+            } catch (const std::exception& e) {
+                oss << " (std::exception: " << e.what() << ")";
+            } catch (const char* msg) {
+                oss << " (C-string: " << msg << ")";
+            } catch (...) {
+                oss << " (truly unknown type)";
+            }
+        }
+        last_error_ = oss.str();
         return false;
     }
 
@@ -855,6 +703,11 @@ bool SpikeEngine::step_until_in_region() {
     while (!is_in_instruction_region(current_pc) && trap_steps < MAX_TRAP_HANDLER_STEPS) {
         try {
             proc_->step(1);
+        } catch (wait_for_interrupt_t&) {
+            // WFI in trap handler - treat as successful step and continue
+            current_pc = get_pc();
+            trap_steps++;
+            continue;
         } catch (trap_t& t) {
             std::ostringstream oss;
             oss << "Trap in handler: " << t.name()
@@ -868,7 +721,22 @@ bool SpikeEngine::step_until_in_region() {
             last_error_ = std::string("Exception in trap handler: ") + e.what();
             return false;
         } catch (...) {
-            last_error_ = "Unknown exception in trap handler";
+            // Try to get more exception info
+            std::exception_ptr eptr = std::current_exception();
+            std::ostringstream oss;
+            oss << "Unknown exception in trap handler";
+            if (eptr) {
+                try {
+                    std::rethrow_exception(eptr);
+                } catch (const std::exception& e) {
+                    oss << " (std::exception: " << e.what() << ")";
+                } catch (const char* msg) {
+                    oss << " (C-string: " << msg << ")";
+                } catch (...) {
+                    oss << " (truly unknown type)";
+                }
+            }
+            last_error_ = oss.str();
             return false;
         }
 
@@ -886,20 +754,17 @@ bool SpikeEngine::step_until_in_region() {
     }
 
     // Success: PC is back in instruction region
-    if (verbose_ && trap_steps > 0) {
-        std::cout << "[SpikeEngine] Trap handler completed in " << trap_steps
-                  << " steps, PC now at 0x" << std::hex << current_pc << std::dec << std::endl;
+    // Record trap information for logging
+    if (trap_steps > 0) {
+        last_execution_trapped_ = true;
+        last_trap_handler_steps_ = trap_steps;
+        if (verbose_) {
+            std::cout << "[SpikeEngine] Trap handler completed in " << trap_steps
+                      << " steps, PC now at 0x" << std::hex << current_pc << std::dec << std::endl;
+        }
     }
 
     return true;
-}
-
-uint64_t SpikeEngine::compute_xor(const std::vector<uint64_t>& values) const {
-    uint64_t result = 0;
-    for (size_t i = 0; i < values.size(); ++i) {
-        result ^= (values[i] << i);
-    }
-    return result;
 }
 
 void SpikeEngine::save_state(Checkpoint& checkpoint) {
@@ -921,10 +786,12 @@ void SpikeEngine::save_state(Checkpoint& checkpoint) {
             throw std::runtime_error("Failed to save XPR registers: Unknown exception");
         }
 
-        // Save floating-point registers
+        // Save floating-point registers (both v[0] and v[1] for complete freg_t state)
+        // v[1] is essential for correct NaN-boxing behavior in some edge cases
         try {
             for (int i = 0; i < 32; ++i) {
                 checkpoint.fpr[i] = state->FPR[i].v[0];
+                checkpoint.fpr_v1[i] = state->FPR[i].v[1];
             }
         } catch (const std::exception& e) {
             throw std::runtime_error(std::string("Failed to save FPR registers: ") + e.what());
@@ -966,7 +833,7 @@ void SpikeEngine::save_state(Checkpoint& checkpoint) {
             }
         }
 
-        // Save memory region (essential for correct rollback of AMO/store instructions)
+        // Save memory region
         if (mem_region_size_ > 0 && mem_region_start_ != 0) {
             checkpoint.mem_region_backup.resize(mem_region_size_);
             for (size_t i = 0; i < mem_region_size_; i += 8) {
@@ -1068,6 +935,43 @@ void SpikeEngine::restore_state(const Checkpoint& checkpoint) {
             // Now safe to restore floating-point CSRs
             restore_csr(0x001, state->fflags);
             restore_csr(0x002, state->frm);
+        }
+
+        // Vector extension CSRs
+        // CRITICAL: Similar to floating-point CSRs, vector CSRs call dirty_vs_state
+        // which will abort() if mstatus.VS == 0. We must temporarily enable VS.
+        //
+        // Strategy:
+        // 1. Temporarily set mstatus.VS to Dirty (0b11) to pass the enabled() check
+        // 2. Use write_raw() if available to bypass dirty_vs_state, otherwise use write()
+        // 3. mstatus will be re-restored at the end to override dirty bits
+        if (proc_->VU.VLEN > 0) {  // Only if V extension is enabled
+            reg_t current_mstatus = state->mstatus->read();
+            reg_t temp_mstatus = (current_mstatus & ~MSTATUS_VS) | MSTATUS_VS;  // VS = Dirty (0b11)
+            state->mstatus->write(temp_mstatus);
+
+            // Restore vector CSRs using write_raw() to bypass dirty_vs_state
+            // write_raw() directly writes without triggering dirty state check
+            if (proc_->VU.vstart && checkpoint.csr_values.count(CSR_VSTART)) {
+                proc_->VU.vstart->write_raw(checkpoint.csr_values.at(CSR_VSTART));
+            }
+            if (proc_->VU.vxrm && checkpoint.csr_values.count(CSR_VXRM)) {
+                proc_->VU.vxrm->write_raw(checkpoint.csr_values.at(CSR_VXRM));
+            }
+            if (proc_->VU.vl && checkpoint.csr_values.count(CSR_VL)) {
+                proc_->VU.vl->write_raw(checkpoint.csr_values.at(CSR_VL));
+            }
+            if (proc_->VU.vtype && checkpoint.csr_values.count(CSR_VTYPE)) {
+                proc_->VU.vtype->write_raw(checkpoint.csr_values.at(CSR_VTYPE));
+            }
+            // vxsat is vxsat_csr_t (not vector_csr_t), so it needs regular write with VS enabled
+            if (proc_->VU.vxsat && checkpoint.csr_values.count(CSR_VXSAT)) {
+                try {
+                    proc_->VU.vxsat->write(checkpoint.csr_values.at(CSR_VXSAT));
+                } catch (...) {
+                    // Silently skip if write fails
+                }
+            }
         }
 
         // Environment configuration CSRs
@@ -1173,33 +1077,74 @@ void SpikeEngine::restore_state(const Checkpoint& checkpoint) {
             }
         }
 
-        // ========== SKIPPED CSRs ==========
-        // The following CSRs are intentionally NOT restored:
+        // ========== UNRESTORABLE CSRs AND IMPACT ANALYSIS ==========
+        // The following CSRs are intentionally NOT restored due to hardware/software constraints.
+        // Analysis of impact on fuzzing instruction execution is provided for each category.
         //
-        // 1. Read-only CSRs (cannot be written):
-        //    - mvendorid (0xF11): Vendor ID
-        //    - marchid (0xF12): Architecture ID
-        //    - mimpid (0xF13): Implementation ID
-        //    - mhartid (0xF14): Hardware thread ID
-        //    - mconfigptr (0xF15): Configuration pointer
+        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
+        // │ 1. HARDWARE CONSTANT CSRs (Read-only, const_csr_t)                                  │
+        // │    - mvendorid (0xF11), marchid (0xF12), mimpid (0xF13)                             │
+        // │    - mhartid (0xF14), mconfigptr (0xF15)                                            │
+        // │                                                                                     │
+        // │    IMPACT: NONE - These are hardware constants that never change during execution. │
+        // │    FUZZ SAFE: YES - No effect on instruction behavior or state transitions.        │
+        // └─────────────────────────────────────────────────────────────────────────────────────┘
         //
-        // 2. Time-related CSRs (managed by simulator):
-        //    - time (0xC01): Timer register (read-only, updated by CLINT)
-        //    - timeh (0xC81): Upper 32 bits of time (RV32 only)
+        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
+        // │ 2. TIME-RELATED CSRs (Managed by CLINT/simulator, time_counter_csr_t)              │
+        // │    - time (0xC01): Timer value, updated by CLINT device                            │
+        // │    - timeh (0xC81): Upper 32 bits of time (RV32 only)                              │
+        // │                                                                                     │
+        // │    IMPACT: LOW - Time values are monotonically increasing and externally managed.  │
+        // │    FUZZ SAFE: YES - Fuzz tests typically don't rely on precise time values.        │
+        // │    NOTE: If testing time-dependent instructions (e.g., WFI with timer interrupts), │
+        // │          time CSR state may affect behavior.          │
+        // └─────────────────────────────────────────────────────────────────────────────────────┘
         //
-        // 3. Performance counter read proxies (derived from mcycle/minstret):
-        //    - cycle (0xC00): Cycle counter (user-mode proxy for mcycle)
-        //    - instret (0xC02): Instructions-retired counter (proxy for minstret)
-        //    - cycleh/instreth (0xC80/0xC82): Upper 32 bits (RV32 only)
-        //    - hpmcounter3-31 (0xC03-0xC1F): Performance counters (read-only)
+        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
+        // │ 3. PERFORMANCE COUNTER PROXIES (Read-only aliases, derived from mcycle/minstret)   │
+        // │    - cycle (0xC00): User-mode alias for mcycle                                     │
+        // │    - instret (0xC02): User-mode alias for minstret                                 │
+        // │    - cycleh/instreth (0xC80/0xC82): Upper 32 bits (RV32)                           │
+        // │    - hpmcounter3-31 (0xC03-0xC1F): Hardware performance counters                   │
+        // │                                                                                     │
+        // │    IMPACT: NONE - These are read-only proxies; actual values come from mcycle/     │
+        // │            minstret which ARE restored above (with bump(0) special handling).      │
+        // │    FUZZ SAFE: YES - Cycle/instret values don't affect instruction semantics.       │
+        // └─────────────────────────────────────────────────────────────────────────────────────┘
         //
-        // 4. Vector extension CSRs (if V extension used, need special handling):
-        //    - vstart, vxsat, vxrm, vcsr, vl, vtype, vlenb
-        //    Note: Vector register file would also need separate handling.
+        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
+        // │ 4. VECTOR REGISTER FILE (Separate from CSRs)                                       │
+        // │    - 32 vector registers (v0-v31), each VLEN bits wide                             │
+        // │    - vlenb (0xC22): Read-only, equals VLEN/8                                       │
+        // │                                                                                     │
+        // │    IMPACT: MEDIUM - Vector register contents are NOT saved/restored currently.     │
+        // │    FUZZ SAFE: PARTIAL - If fuzzing vector instructions:                            │
+        // │      * Source operand values may differ after restore (affects result correctness) │
+        // │      * Destination register values persist (may cause false positive duplicates)   │
+        // │    RECOMMENDATION: For V-extension fuzzing, consider adding vector register        │
+        // │                    save/restore to Checkpoint structure.                           │
+        // └─────────────────────────────────────────────────────────────────────────────────────┘
         //
-        // 5. Crypto extension CSRs:
-        //    - seed (0x015): Entropy source (read has side effects)
-        // ===================================
+        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
+        // │ 5. CRYPTO EXTENSION CSRs (Side-effect on read)                                     │
+        // │    - seed (0x015): Entropy source for Zkr extension                                │
+        // │      * Read triggers wipe (returns random value, then clears internal state)       │
+        // │      * Write-only in practice; saved value is meaningless                          │
+        // │                                                                                     │
+        // │    IMPACT: LOW - Entropy source is non-deterministic by design.                    │
+        // │    FUZZ SAFE: YES - Random values don't affect instruction correctness testing.    │
+        // │    NOTE: If testing crypto instructions, results will be non-deterministic anyway. │
+        // └─────────────────────────────────────────────────────────────────────────────────────┘
+        //
+        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
+        // │ 6. INTERRUPT/EXCEPTION STATE (Complex state machine)                               │
+        // │    - Various *topi CSRs (mtopi, stopi, vstopi): Read-only interrupt priority       │
+        // │    - scountovf (0xDA0): Read-only counter overflow status                          │
+        // │                                                                                     │
+        // │    IMPACT: LOW - These reflect dynamic interrupt state, not persistent config.     │
+        // │    FUZZ SAFE: YES - Interrupt priority is recalculated from mip/mie/mideleg.       │
+        // └─────────────────────────────────────────────────────────────────────────────────────┘
 
         // ========== FINAL STATUS RESTORE ==========
         // Re-restore mstatus/sstatus AFTER floating-point CSRs to override dirty bits
@@ -1213,11 +1158,12 @@ void SpikeEngine::restore_state(const Checkpoint& checkpoint) {
             state->XPR.write(i, checkpoint.xpr[i]);
         }
 
-        // Restore floating-point registers
+        // Restore floating-point registers (both v[0] and v[1] for complete freg_t state)
+        // Restoring v[1] is essential for correct NaN-boxing behavior
         for (int i = 0; i < 32; ++i) {
             freg_t freg_val;
             freg_val.v[0] = checkpoint.fpr[i];
-            freg_val.v[1] = 0;
+            freg_val.v[1] = checkpoint.fpr_v1[i];  // Use saved v[1] instead of 0
             state->FPR.write(i, freg_val);
         }
 
@@ -1237,6 +1183,13 @@ void SpikeEngine::restore_state(const Checkpoint& checkpoint) {
                 sim_->debug_mmu->store<uint8_t>(mem_region_start_ + i, checkpoint.mem_region_backup[i]);
             }
         }
+
+        // CRITICAL: Flush TLB and instruction cache after restoring state.
+        // After restoring CSRs (mstatus, satp, pmp*, etc.), the TLB may contain
+        // stale entries that don't match the restored privilege/translation state.
+        // flush_tlb() clears all TLB entries and also calls flush_icache().
+        // This ensures consistent state for both instruction fetch and data access.
+        proc_->get_mmu()->flush_tlb();
 
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("Failed to restore checkpoint: ") + e.what());
